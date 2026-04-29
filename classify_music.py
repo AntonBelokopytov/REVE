@@ -1,133 +1,111 @@
-import mne
-import numpy as np
+# %% БЛОК 1: Импорты и загрузка базовой модели
 import torch
+from transformers import AutoModel
+import mne
+from scipy.spatial import procrustes
 import matplotlib.pyplot as plt
-import umap
-from braindecode.models import REVE
-from huggingface_hub import login  
+import numpy as np
 
-# %%
-login(token="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")
+# Твой токен от HuggingFace
+my_token = "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"
 
-# %%
-fpath = 'D:/OS(CURRENT)/data/music/exp2/20.03_g1/Tumyalis_clear.fif'
-raw = mne.io.read_raw_fif(fpath, preload=True)
-raw.resample(200) 
-
-# %%
-# raw_f = raw.filter(l_freq=15, h_freq=25) 
-
-# %%
-window_duration = 2
-epochs = mne.make_fixed_length_epochs(raw, duration=window_duration, preload=True)
-data = epochs.get_data()  
-
-mean = data.mean(axis=2, keepdims=True)
-std = data.std(axis=2, keepdims=True)
-std[std == 0] = 1.0  
-
-data_zscored = (data - mean) / std
-data_ready = np.clip(data_zscored, -15, 15)
-eeg_tensor = torch.tensor(data_ready, dtype=torch.float32)
-
-# %%
-print("Загрузка весов REVE...")
-model = REVE.from_pretrained(
-    "brain-bzh/reve-base",  
-    n_outputs=512,         
-    n_chans=raw.info['nchan'],
-    n_times=eeg_tensor.shape[2],
-    sfreq=raw.info['sfreq'],
-    chs_info=[{"ch_name": ch} for ch in raw.ch_names],
-    attention_pooling=True  
+# Загружаем саму модель
+model = AutoModel.from_pretrained(
+    "brain-bzh/reve-base", 
+    trust_remote_code=True, 
+    token=my_token
 )
-model.eval() 
-
-pos = model.get_positions(raw.ch_names)
-
-# %%
-from torch.utils.data import TensorDataset, DataLoader
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
 model.eval()
 
-batch_size = 100
-dataset = TensorDataset(eeg_tensor)
-loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+# %% БЛОК 2: Подготовка данных ЭЭГ (загрузка и ресемплинг)
+fpath = 'REVE_aos/MNE-eegbci-data/files/eegmmidb/1.0.0/S001/S001R04.edf'
+raw = mne.io.read_raw_edf(fpath, preload=True)
 
-all_embeddings = []
+# Модель обучалась на 200 Гц, поэтому обязательно меняем частоту
+raw.resample(200)
 
+# %% БЛОК 3: Выравнивание каналов и извлечение позиций электродов
+# 1. Загружаем банк позиций
+pos_bank = AutoModel.from_pretrained(
+    "brain-bzh/reve-positions", 
+    trust_remote_code=True, 
+    token=my_token
+)
+
+# 2. Очищаем названия каналов текущей записи
+clean_ch_names = [ch.replace('.', '').strip().upper() for ch in raw.ch_names]
+
+# 3. Получаем тензор позиций для тех каналов, которые знает модель
+positions = pos_bank(clean_ch_names)
+
+# ВАЖНО: Добавляем батч-измерение для позиций (1, N_channels, 3)
+batch_pos = positions.unsqueeze(0)
+
+# 4. Находим оригинальные имена каналов, которых нет в словаре pos_bank
+valid_positions = set(pos_bank.position_names)
+channels_to_drop = [
+    orig_ch for orig_ch, clean_ch in zip(raw.ch_names, clean_ch_names)
+    if clean_ch not in valid_positions
+]
+
+print(f"Каналы, не найденные в словаре REVE (будут удалены): {channels_to_drop}")
+
+# 5. Синхронизируем: удаляем неизвестные каналы из ЭЭГ
+raw_filtered = raw.copy().drop_channels(channels_to_drop)
+
+# 6. Вырезаем кусок данных (4 секунды при 200 Гц = 800 отсчетов)
+window_samples = 4 * 200
+eeg_data_filtered = raw_filtered.get_data(start=0, stop=window_samples)
+
+# 7. Формируем итоговый батч ЭЭГ (1, N_channels, Time)
+batch_eeg = torch.tensor(eeg_data_filtered, dtype=torch.float32).unsqueeze(0)
+
+print(f"Размерность batch_eeg: {batch_eeg.shape}")
+print(f"Размерность batch_pos: {batch_pos.shape}")
+
+# %% БЛОК 4: Прогон через модель и сбор слоев (без хуков)
+model.eval()
+
+# Прогоняем данные со специальным флагом return_output=True
+# В этом режиме REVE возвращает список (list) тензоров для каждого слоя
 with torch.no_grad():
-    for batch in loader:
-        X_batch = batch[0].to(device)
-        
-        batch_pos = pos.expand(X_batch.shape[0], -1, -1).to(device)                
-        embeddings = model(X_batch, pos=batch_pos)
-        
-        all_embeddings.append(embeddings.cpu().numpy())
+    outputs = model(batch_eeg, batch_pos, return_output=True)
 
-features_flat = np.concatenate(all_embeddings, axis=0)
+# outputs — это список. Первый элемент outputs[0] — это вход в трансформер.
+# outputs[1] до outputs[22] — это выходы после каждого из 22 слоев энкодера.
+# Нам нужны только тензоры, переводим их в numpy.
+layer_outputs = [out.detach().cpu().numpy() for out in outputs]
 
-# %%
-reducer = umap.UMAP(
-    n_components=3, 
-    metric='cosine', 
-    n_neighbors=20, 
-    min_dist=0.1
-)
-embeddings_3d_umap = reducer.fit_transform(features_flat)
+print(f"Количество собранных слоев: {len(layer_outputs)}")
 
-# %%
-n_epochs_per_label = embeddings_3d_umap.shape[0]/22
-descriptions = raw.annotations.description
+# %% БЛОК 5: Вычисление метрики Procrustes и отрисовка графика
+linearity_scores = []
 
-# Генерируем массив строк
-true_labels_str = np.repeat(descriptions, n_epochs_per_label)
+# Считаем линейность (схожесть) между каждыми соседними слоями i и i+1
+for i in range(len(layer_outputs) - 1):
+    # Убираем батч (индекс 0), получаем 2D матрицу [Sequence_length, Hidden_dim]
+    layer_a = layer_outputs[i][0]
+    layer_b = layer_outputs[i + 1][0]
+    
+    # scipy.spatial.procrustes возвращает (matrix1, matrix2, disparity)
+    # disparity — это ошибка несовпадения (чем меньше, тем больше матрицы похожи)
+    _, _, disparity = procrustes(layer_a, layer_b)
+    
+    # Линейность считаем как 1 - disparity (чем ближе к 1, тем линейнее переход)
+    similarity = 1.0 - disparity
+    linearity_scores.append(similarity)
 
-# Переводим в числа для раскраски графика
-unique_labels = list(dict.fromkeys(descriptions)) 
-label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
-true_labels_int = np.array([label_to_idx[lbl] for lbl in true_labels_str])
-print(f"Сгенерировано меток: {len(true_labels_int)}")
+# Отрисовка
+plt.figure(figsize=(10, 5))
+plt.plot(range(1, len(linearity_scores) + 1), linearity_scores, marker='o', linestyle='-', color='b')
 
-# =====================================================================
-# 8. 3D ВИЗУАЛИЗАЦИЯ ПО ЭКСПЕРИМЕНТАЛЬНЫМ СОСТОЯНИЯМ
-# =====================================================================
-fig = plt.figure(figsize=(14, 10))  
-ax = fig.add_subplot(111, projection='3d')
-
-scatter = ax.scatter(
-    embeddings_3d_umap[:, 0], 
-    embeddings_3d_umap[:, 1], 
-    embeddings_3d_umap[:, 2], 
-    c=true_labels_int, 
-    cmap='turbo',      
-    s=25,              
-    alpha=0.8          
-)
-
-# Создаем легенду
-handles = []
-for i, lbl in enumerate(unique_labels):
-    color = plt.cm.turbo(i / (len(unique_labels) - 1))
-    handle = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=8)
-    handles.append(handle)
-
-ax.legend(handles, unique_labels, title="Экспериментальные состояния", 
-          bbox_to_anchor=(1.05, 1), loc='upper left')
-
-ax.set_title('Проекция эмбеддингов REVE (с Attention Pooling) с учетом стимулов', fontsize=14)
-ax.set_xlabel('UMAP 1')
-ax.set_ylabel('UMAP 2')
-ax.set_zlabel('UMAP 3')
-
+plt.xlabel("Layer Transition (i -> i+1)")
+plt.ylabel("Procrustes Linearity Score")
+plt.title("REVE-Base: Layer-to-Layer Linearity (Procrustes Metric)")
+plt.xticks(range(1, len(linearity_scores) + 1))
+plt.grid(True, linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
-
-# %%
-
-# %%
 
 # %%
 
