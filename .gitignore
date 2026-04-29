@@ -1,0 +1,6 @@
+# Игнорировать папки с результатами и данными
+REVE_aos/latents_paper/
+REVE_aos/MNE-eegbci-data/
+
+# Игнорировать кэш Python
+REVE_aos/code/__pycache__/
