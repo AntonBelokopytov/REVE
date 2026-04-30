@@ -119,7 +119,7 @@ for sid in tqdm(range(1, 110), desc="Обработка испытуемых"):
             # Возвращаем 3D структуру: (Batch, 248 токенов, 512 размерность)
             tokens_3d = raw_features.view(X_batch.shape[0], -1, 512)
             
-            # ыСохраняем сырые 3D тензоры
+            # Сохраняем сырые 3D тензоры
             subj_features.append(tokens_3d.cpu().numpy())
             
     # Аккуратно склеиваем батчи для одного испытуемого
@@ -189,7 +189,6 @@ axes[1].legend(title="Движение")
 
 plt.tight_layout()
 plt.show()
-
 
 # %%
 
