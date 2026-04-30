@@ -8,6 +8,9 @@ import seaborn as sns
 
 from braindecode.models import REVE
 from transformers import AutoModel
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import accuracy_score
 
 # %% 1. Инициализация моделей
 my_token = "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"
@@ -163,3 +166,20 @@ axes[1].legend(title="Воображаемое движение")
 
 plt.tight_layout()
 plt.show()
+
+# %% 4. Линейное пробирование (Linear Probing)
+print("\n--- Выполнение линейного пробирования ---")
+# Используем логистическую регрессию для оценки качества извлеченных признаков (насколько они линейно разделимы)
+clf = LogisticRegression(max_iter=1000, random_state=42)
+
+# Оценка качества модели с помощью 5-кратной кросс-валидации
+scores = cross_val_score(clf, X_features, y_labels, cv=5, scoring='accuracy')
+
+print(f"Точность (Accuracy) линейной пробы на кросс-валидации (5 фолдов): {scores}")
+print(f"Средняя точность кросс-валидации: {scores.mean():.4f} ± {scores.std():.4f}")
+
+# Обучаем модель на всех данных
+clf.fit(X_features, y_labels)
+y_pred = clf.predict(X_features)
+train_acc = accuracy_score(y_labels, y_pred)
+print(f"Точность (Accuracy) на всей выборке: {train_acc:.4f}")
