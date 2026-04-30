@@ -50,41 +50,46 @@ for sid in tqdm(range(1, 110), desc="Обработка испытуемых"):
     raws = []
     skip_subject = False
     
-    def z_score_and_clip(x):
-        mean = np.mean(x)
-        std = np.std(x)
-        # Нормируем по каналу и клипаем выбросы на уровне ±15
-        return np.clip((x - mean) / (std + 1e-6), -15.0, 15.0)
-
-    # Внутри вашего цикла по испытуемым:
     for r in runs:
         fpath = f'REVE_aos/MNE-eegbci-data/files/eegmmidb/1.0.0/S{sid:03d}/S{sid:03d}R{r}.edf'
         if not os.path.exists(fpath):
             skip_subject = True; break
             
-        try:
-            raw_tmp = mne.io.read_raw_edf(fpath, preload=True, verbose=False)
-            mne.rename_channels(raw_tmp.info, {ch: ch.replace('.', '').strip().upper() for ch in raw_tmp.ch_names})
+        raw_tmp = mne.io.read_raw_edf(fpath, preload=True, verbose=False)
+        mne.rename_channels(raw_tmp.info, {ch: ch.replace('.', '').strip().upper() for ch in raw_tmp.ch_names})
+        if len(raw.info["bads"]) > 0:
+            raw.interpolate_bads()
+        mapping = {'T1': 'Left', 'T2': 'Right'} if r in ['04', '08', '12'] else {'T1': 'BothFists', 'T2': 'BothFeet'}
+        raw_tmp.annotations.rename(mapping)
+        
+        # Применяем band-pass фильтр: от 0.5 Гц до 64 Гц (специфика REVE для PhysioNet)
+        if raw_tmp.info['lowpass'] > 64:
+            raw_tmp.filter(l_freq=0.5, h_freq=64.0, verbose=False)
+        else:
+            raw_tmp.filter(l_freq=0.5, h_freq=None, verbose=False)
             
-            mapping = {'T1': 'Left', 'T2': 'Right'} if r in ['04', '08', '12'] else {'T1': 'BothFists', 'T2': 'BothFeet'}
-            raw_tmp.annotations.rename(mapping)
-            raw_tmp.filter(l_freq=0.5,h_freq=80)
-
-            # --- НОВЫЙ БЛОК: Применяем нормировку К ИСХОДНОМУ РАНУ ---
-            raw_tmp.apply_function(z_score_and_clip, channel_wise=True)
-            # ---------------------------------------------------------
-            
-            raws.append(raw_tmp)
-        except Exception as e:
-            skip_subject = True; break
+        raws.append(raw_tmp)
             
     if skip_subject or not raws: continue
 
-    # Теперь склеиваем уже честно отнормированные записи
+    # 1. Сначала склеиваем данные ВСЕЙ сессии
     raw = mne.concatenate_raws(raws)
-    raw.set_eeg_reference(ref_channels='average', verbose=False)
-    raw.resample(200, verbose=False)
     
+    # 2. Выполняем ресемплинг до 200 Гц ПОСЛЕ применения фильтра 64 Гц
+    raw.resample(200, verbose=False)
+    raw.set_eeg_reference(ref_channels='average', verbose=False)
+    
+    channels_to_drop = [ch for ch in raw.ch_names if ch not in valid_positions]
+    raw.drop_channels(channels_to_drop)
+
+    # 3. Применяем Z-нормализацию и клиппинг ко всей сессии испытуемого сразу
+    def z_score_and_clip(x):
+        mean = np.mean(x)
+        std = np.std(x)
+        return np.clip((x - mean) / (std + 1e-6), -15.0, 15.0)
+
+    raw.apply_function(z_score_and_clip, channel_wise=True)
+        
     channels_to_drop = [ch for ch in raw.ch_names if ch not in valid_positions]
     raw.drop_channels(channels_to_drop)
     
@@ -153,8 +158,8 @@ fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
 # График 1: Испытуемые
 sns.scatterplot(
-    x=X_subspace[:, 0], 
-    y=X_subspace[:, 1], 
+    x=embedding_2d[:, 0], 
+    y=embedding_2d[:, 1], 
     hue=y_subjects,
     palette=sns.color_palette("husl", len(np.unique(y_subjects))),
     ax=axes[0],
@@ -172,8 +177,8 @@ for l in y_labels:
     else: task_names.append('Both Feet')
 
 sns.scatterplot(
-    x=X_subspace[:, 0], 
-    y=X_subspace[:, 1], 
+    x=embedding_2d[:, 0], 
+    y=embedding_2d[:, 1], 
     hue=task_names,
     palette=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'],
     ax=axes[1],
@@ -184,3 +189,7 @@ axes[1].legend(title="Движение")
 
 plt.tight_layout()
 plt.show()
+
+
+# %%
+
